@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 
@@ -10,6 +11,9 @@ from pipeline import process_message
 load_dotenv()
 DISCORD_MODE = os.getenv('DISCORD_MODE', 'bot').strip().lower()
 SIGNAL_CHANNEL_ID = os.getenv('SIGNAL_CHANNEL_ID')
+RUNNER_ENABLED = os.getenv('RUNNER_ENABLED', 'false').strip().lower() == 'true'
+RUNNER_INTERVAL = float(os.getenv('RUNNER_INTERVAL_SECONDS', '15'))
+NOTIFY_CHANNEL_ID = os.getenv('NOTIFY_CHANNEL_ID')
 
 if DISCORD_MODE == 'user':
     import selfcord as discord
@@ -72,10 +76,53 @@ def store_signal_message(message):
             )
 
 
+_runner_task = None
+
+
+async def _notify(text):
+    if not NOTIFY_CHANNEL_ID:
+        return
+    channel = client.get_channel(int(NOTIFY_CHANNEL_ID))
+    if channel is None:
+        return
+    try:
+        await channel.send(text[:1900])
+    except Exception:  # noqa: BLE001
+        logging.getLogger('stockbot').exception('notify failed')
+
+
+async def _runner_loop():
+    from execution.alpaca import AlpacaPaperBroker
+    from rules import Rules
+    from runner import Runner
+
+    rules = Rules.from_env()
+    runner = Runner(AlpacaPaperBroker(), rules)
+    log = logging.getLogger('stockbot.runner')
+    log.info('runner started: %s', rules)
+    await _notify(f'runner online (paper) - {rules.contracts_per_entry} contracts/entry, '
+                  f'max loss ${rules.max_daily_loss:g}')
+    while not client.is_closed():
+        try:
+            events = await asyncio.to_thread(runner.tick)
+        except Exception:  # noqa: BLE001
+            log.exception('runner tick crashed')
+            events = ['ERROR: runner tick crashed, see log']
+        if events:
+            await _notify('\n'.join(events))
+        if runner.halted:
+            await _notify(f'runner HALTED. Remove the {rules.kill_switch_file} file and restart to resume.')
+            return
+        await asyncio.sleep(RUNNER_INTERVAL)
+
+
 @client.event
 async def on_ready():
+    global _runner_task
     init_db()
     print(f'{client.user} is ready in {DISCORD_MODE} mode.')
+    if RUNNER_ENABLED and _runner_task is None:
+        _runner_task = asyncio.create_task(_runner_loop())
 
 
 @client.event

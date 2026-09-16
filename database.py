@@ -123,6 +123,60 @@ MIGRATIONS = [
         )
         ''',
     ]),
+    # Phase 3: execution. positions/orders replace paper_trades.
+    (3, [
+        "ALTER TABLE signal_updates ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'pending'",
+        'ALTER TABLE signal_updates ADD COLUMN executed_at TEXT',
+        'ALTER TABLE signal_updates ADD COLUMN execution_note TEXT',
+        'CREATE INDEX IF NOT EXISTS idx_updates_exec ON signal_updates(execution_status)',
+        '''
+        CREATE TABLE IF NOT EXISTS positions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id       INTEGER NOT NULL UNIQUE REFERENCES option_signals(id),
+            broker          TEXT NOT NULL,
+            contract_symbol TEXT NOT NULL,
+            qty_target      INTEGER NOT NULL,
+            qty_opened      INTEGER NOT NULL DEFAULT 0,
+            remaining_qty   INTEGER NOT NULL DEFAULT 0,
+            avg_cost        REAL,
+            realized_pnl    REAL NOT NULL DEFAULT 0,
+            stop_price      REAL,
+            trimmed         INTEGER NOT NULL DEFAULT 0,
+            status          TEXT NOT NULL DEFAULT 'opening'
+                            CHECK (status IN ('opening','open','closed','missed','error')),
+            exit_reason     TEXT,
+            entry_bid       REAL, entry_ask REAL, entry_delta REAL, entry_iv REAL,
+            source_entry    REAL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            opened_at       TEXT,
+            closed_at       TEXT
+        )
+        ''',
+        'CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)',
+        '''
+        CREATE TABLE IF NOT EXISTS orders (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id     INTEGER NOT NULL REFERENCES positions(id),
+            update_id       INTEGER REFERENCES signal_updates(id),
+            broker          TEXT NOT NULL,
+            broker_order_id TEXT,
+            client_order_id TEXT,
+            side            TEXT NOT NULL CHECK (side IN ('buy','sell')),
+            reason          TEXT NOT NULL,
+            qty             INTEGER NOT NULL,
+            limit_price     REAL,
+            status          TEXT NOT NULL DEFAULT 'new',
+            filled_qty      INTEGER NOT NULL DEFAULT 0,
+            fill_price      REAL,
+            error           TEXT,
+            submitted_at    TEXT,
+            filled_at       TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        ''',
+        'CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)',
+        'CREATE INDEX IF NOT EXISTS idx_orders_position ON orders(position_id)',
+    ]),
 ]
 
 
@@ -461,6 +515,148 @@ def update_trade(trade_id, status, broker_order_id=None, fill_price=None,
 
 
 # ---------------------------------------------------------------------------
+# positions / orders (Phase 3)
+# ---------------------------------------------------------------------------
+
+def get_signals_awaiting_entry():
+    with get_connection() as conn:
+        rows = conn.execute('''
+            SELECT s.*, m.created_at AS message_created_at
+            FROM option_signals s
+            JOIN messages m ON m.id = s.message_id
+            LEFT JOIN positions p ON p.signal_id = s.id
+            WHERE s.trade_status = 'pending' AND s.action = 'buy' AND p.id IS NULL
+            ORDER BY m.created_at ASC
+        ''').fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_pending_updates():
+    with get_connection() as conn:
+        rows = conn.execute('''
+            SELECT u.*, m.created_at AS message_created_at
+            FROM signal_updates u
+            JOIN messages m ON m.id = u.message_id
+            WHERE u.execution_status = 'pending'
+            ORDER BY m.created_at ASC, u.id ASC
+        ''').fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_update_executed(update_id, status, note=None):
+    with get_connection() as conn:
+        conn.execute('''
+            UPDATE signal_updates
+            SET execution_status = ?, execution_note = ?, executed_at = datetime('now')
+            WHERE id = ?
+        ''', (status, note, update_id))
+
+
+def insert_position(signal_id, broker, contract_symbol, qty_target, source_entry=None,
+                    entry_bid=None, entry_ask=None, entry_delta=None, entry_iv=None,
+                    status='opening'):
+    with get_connection() as conn:
+        cur = conn.execute('''
+            INSERT INTO positions
+                (signal_id, broker, contract_symbol, qty_target, source_entry,
+                 entry_bid, entry_ask, entry_delta, entry_iv, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (signal_id, broker, contract_symbol, qty_target, source_entry,
+              entry_bid, entry_ask, entry_delta, entry_iv, status))
+        return cur.lastrowid
+
+
+_POSITION_SELECT = '''
+    SELECT p.*, s.ticker, s.option_type, s.strike, s.expiration
+    FROM positions p JOIN option_signals s ON s.id = p.signal_id
+'''
+
+
+def get_position(position_id):
+    with get_connection() as conn:
+        row = conn.execute(_POSITION_SELECT + ' WHERE p.id = ?', (position_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_position_by_signal(signal_id):
+    with get_connection() as conn:
+        row = conn.execute(_POSITION_SELECT + ' WHERE p.signal_id = ?', (signal_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_positions(statuses=('opening', 'open')):
+    with get_connection() as conn:
+        marks = ','.join('?' * len(statuses))
+        rows = conn.execute(
+            _POSITION_SELECT + f' WHERE p.status IN ({marks}) ORDER BY p.id',
+            tuple(statuses)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_position(position_id, **fields):
+    if not fields:
+        return
+    cols = ', '.join(f'{k} = ?' for k in fields)
+    with get_connection() as conn:
+        conn.execute(f'UPDATE positions SET {cols} WHERE id = ?',
+                     (*fields.values(), position_id))
+
+
+def insert_order(position_id, broker, side, reason, qty, limit_price, update_id=None,
+                 broker_order_id=None, client_order_id=None, status='new',
+                 submitted_at=None, error=None):
+    with get_connection() as conn:
+        cur = conn.execute('''
+            INSERT INTO orders
+                (position_id, update_id, broker, broker_order_id, client_order_id,
+                 side, reason, qty, limit_price, status, submitted_at, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (position_id, update_id, broker, broker_order_id, client_order_id,
+              side, reason, qty, limit_price, status, submitted_at, error))
+        return cur.lastrowid
+
+
+def update_order(order_id, **fields):
+    if not fields:
+        return
+    cols = ', '.join(f'{k} = ?' for k in fields)
+    with get_connection() as conn:
+        conn.execute(f'UPDATE orders SET {cols} WHERE id = ?',
+                     (*fields.values(), order_id))
+
+
+def get_order(order_id):
+    with get_connection() as conn:
+        row = conn.execute('SELECT * FROM orders WHERE id = ?', (order_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_working_orders(position_id=None, side=None):
+    with get_connection() as conn:
+        sql = '''
+            SELECT * FROM orders
+            WHERE status NOT IN ('filled','canceled','cancelled','expired','rejected','error')
+              AND broker_order_id IS NOT NULL
+        '''
+        params = []
+        if position_id is not None:
+            sql += ' AND position_id = ?'; params.append(position_id)
+        if side is not None:
+            sql += ' AND side = ?'; params.append(side)
+        sql += ' ORDER BY id'
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def get_realized_pnl_since(since_iso):
+    with get_connection() as conn:
+        row = conn.execute('''
+            SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM positions
+            WHERE COALESCE(closed_at, created_at) >= ? OR status IN ('open','opening')
+        ''', (since_iso,)).fetchone()
+        return float(row['pnl'])
+
+
+# ---------------------------------------------------------------------------
 # replay support
 # ---------------------------------------------------------------------------
 
@@ -468,6 +664,8 @@ def clear_parse_results():
     """Wipe everything derived from messages so the parser can be re-run."""
     with get_connection() as conn:
         conn.execute('DELETE FROM needs_label')
+        conn.execute('DELETE FROM orders')
+        conn.execute('DELETE FROM positions')
         conn.execute('DELETE FROM signal_updates')
         conn.execute('DELETE FROM paper_trades')
         conn.execute('DELETE FROM option_signals')

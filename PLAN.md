@@ -205,6 +205,23 @@ Optional, cheap, and useful for P&L review: snapshot the contract's quote + Gree
 
 **Exit criterion:** 4+ weeks of paper with every source entry mirrored (or explicitly `missed` with a reason), every source exit mirrored within 60 s, no position ever reaching expiry unmanaged, `needs_label` handled same-day.
 
+### 3.4 Status (2026-09-16) — built, not yet run on a live market day
+
+| Item | File | State |
+|---|---|---|
+| Alpaca paper account | — | created; level 3 options; keys in `.env`; `tools/alpaca_check.py` passes |
+| Broker interface + Alpaca implementation | `execution/base.py`, `execution/alpaca.py` | done; hard-wired to paper |
+| Schema v3: `positions`, `orders`, execution tracking on `signal_updates` | `database.py` | done, applied |
+| Rules (env-configurable) | `rules.py` | done; defaults: 3 contracts, max 3 open, $500 daily loss, +10 % chase, 5-min entry TTL, −50 % hard stop, 15:45 ET time stop, spread ≤ 25 %, OI ≥ 100, `KILL` file |
+| Runner loop | `runner.py` | done: entries → buy at min(ask, cap); trim/close/stop from updates; runner break-even stop after any trim; hard/time stops; sell re-pricing; entry TTL → missed; source-exits-before-fill → cancel + missed; daily-loss halt writes the `KILL` file and flattens |
+| Discord integration | `main.py` | `RUNNER_ENABLED=true` starts the loop in-process; events posted to `NOTIFY_CHANNEL_ID` |
+| Manual tools | `tools/paper_trade.py` | open / trim / close / status / cancel / positions |
+| Tests | `tests/test_runner.py` (FakeBroker) | 16 scenarios; 101 total passing |
+
+Live smoke: one manual paper order (3 × SPY 754P 9/17 @ 2.94) placed after hours and queued for the 9/17 open; one `runner --once` tick against the real account skipped all 4 stale test signals and placed nothing.
+
+Known gaps for the first live week: `add` updates are recorded but not executed; `needs_label` items are not auto-notified to Discord yet; the runner and `tools/paper_trade.py` don't know about each other's positions (the manual test order is not in `positions`).
+
 ---
 
 ## 4. Phase 4 — Live on the Robinhood agentic account
