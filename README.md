@@ -31,7 +31,7 @@ Discord channel ──> main.py (ingest) ──> stock_msg.db (messages)
    | action | example | effect |
    |---|---|---|
    | `price_update` | `$.99 HERE ON SPY PUTS / UP +48%` | none — status only |
-   | `trim` | `SOLD MAJORITY 🚨` | sell 75 % (rounded), keep the runner |
+   | `trim` | `SOLD MAJORITY ` | sell 75 % (rounded), keep the runner |
    | `close` | `ALL OUT`, `runners out` | sell everything left |
    | `stop` | `stop at .25` | tighten our stop (never loosen) |
    | `add` | `added at .28` | recorded, not executed yet |
